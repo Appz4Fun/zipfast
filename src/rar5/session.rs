@@ -1365,7 +1365,12 @@ impl Catalogue {
                 return Err(volume_framing(&path, "RAR volume header encryption changed"));
             }
             let volume_index = self.session.volumes.len();
-            let mut next = volume.main.is_volume().then_some(false);
+            // DamagedInput::Salvage: a later volume whose main header can't be read is still taken as one of the
+            // set, as UnRAR 7.30 goes on to the volume after it
+            let set = self.options.damaged_input == crate::extract::DamagedInput::Salvage
+                && volume.main_missing()
+                && self.session.volumes.first().is_some_and(|v| v.metadata.main.is_volume());
+            let mut next = (volume.main.is_volume() || set).then_some(false);
             let first_header = self.session.headers.len();
             let mut end = None;
             let mut comment = None;
@@ -1375,6 +1380,15 @@ impl Catalogue {
                 // bytes passed over break the solid history: a solid member after them chains to nothing
                 if damage.iter().any(|d| d.passed_over) {
                     self.history_barrier = true;
+                    // and where they come before a split member's next part in this volume, nothing continues it:
+                    // UnRAR 7.30 reads that part's header first, and joins no later volume's part to it. It ends
+                    // where its data did, read on as zeros, as a member the archive cuts short does (HeaderCut::Data)
+                    if self.options.damaged_input == crate::extract::DamagedInput::Salvage
+                        && self.pending
+                        && !self.continued_in(volume_index)
+                    {
+                        self.end_pending(RarIntegrityReason::TruncatedData)?;
+                    }
                 }
                 self.keep_damage(damage)?;
                 let Some((block, crypt, wire)) = parsed? else { break };
@@ -1404,6 +1418,14 @@ impl Catalogue {
                     Block::Main(_) | Block::Crypt => return Err(volume_framing(&path, "unexpected RAR volume header")),
                     Block::Unknown => {}
                 }
+            }
+            // DamagedInput::Salvage: a later volume that ends holding no part of the split member waiting for one
+            // (its first header, which UnRAR 7.30 reads for the next part, being some other or none) ends it there
+            if self.options.damaged_input == crate::extract::DamagedInput::Salvage
+                && self.pending
+                && !self.continued_in(volume_index)
+            {
+                self.end_pending(RarIntegrityReason::TruncatedData)?;
             }
             let original = add(
                 volume.main.original_name.as_ref().map_or(0, |name| name.capacity() as u64),
@@ -1513,9 +1535,16 @@ impl Catalogue {
         let parts = add(self.session.usage.parts, 1)?;
         limit(parts, self.options.limits.parts, RarResource::CatalogueParts)?;
         self.session.usage.parts = parts;
+        // a RAR 4.x continuation header cut short (HeaderCut::Header) continues nothing: UnRAR 7.30 fails the member
+        // with what it had, and the header is an orphan continuation
         let associated = self.pending
+            && header.cut != Some(super::HeaderCut::Header)
             && self.session.model.members.last().is_some_and(|member| member.matches_continuation(&header, &wire));
         if !associated {
+            if header.cut == Some(super::HeaderCut::Header) && header.split_before() {
+                // a continuation header cut short: the member ends as at a header that can't be read (above)
+                self.end_pending(RarIntegrityReason::TruncatedData)?;
+            }
             self.end_incomplete()?;
             if header.split_before() {
                 self.session.archive.orphan_continuations = add(self.session.archive.orphan_continuations, 1)?;
@@ -1681,11 +1710,23 @@ impl Catalogue {
         self.update_capacity()
     }
 
+    /// Whether the member waiting for its next part has a part in volume `volume`.
+    fn continued_in(&self, volume: usize) -> bool {
+        self.session.model.members.last().is_some_and(|member| {
+            member.parts.end > member.parts.start && self.session.model.parts[member.parts.end - 1].volume == volume
+        })
+    }
+
     fn end_incomplete(&mut self) -> RarResult<()> {
+        self.end_pending(RarIntegrityReason::MissingSplitContinuation)
+    }
+
+    /// Ends the member waiting for its next part, failing it for `reason` unless it fails already.
+    fn end_pending(&mut self, reason: RarIntegrityReason) -> RarResult<()> {
         if std::mem::take(&mut self.pending) {
             let index = self.session.model.members.len() - 1;
             if self.session.model.members[index].issue.is_none() {
-                let issue = member_integrity(index as u64, RarIntegrityReason::MissingSplitContinuation);
+                let issue = member_integrity(index as u64, reason);
                 self.session.model.members[index].issue = self.retain_issue(Some(issue))?;
                 self.update_capacity()?;
             }

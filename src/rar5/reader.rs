@@ -451,6 +451,8 @@ pub struct Volume {
     damage_closed: bool,
     /// A block found where the main header should be, under salvage: handed out first.
     held_block: Option<ParsedBlock>,
+    /// Whether no main header could be read, under salvage (the volume is read on with an empty one).
+    main_missing: bool,
     /// Checksum work the resyncs in this volume have left, once one has run.
     resync_work: Option<u64>,
     /// The run's cancellation, for a resync's search.
@@ -695,6 +697,7 @@ impl Volume {
             damage: Vec::new(),
             damage_closed: false,
             held_block: None,
+            main_missing: false,
             resync_work: None,
             cancel: None,
             sfx: next.saturating_sub(match format {
@@ -712,6 +715,7 @@ impl Volume {
                     vol.main.rar4_flags = Some(0);
                 }
                 vol.held_block = other;
+                vol.main_missing = true;
             }
             _ => {
                 return Err(vol.header_fault(
@@ -765,6 +769,11 @@ impl Volume {
         self.header_key.is_some()
             || self.legacy_keys.is_some()
             || self.main.rar4_flags.is_some_and(|flags| flags & super::MHD_PASSWORD != 0)
+    }
+
+    /// Whether no main header could be read: a salvaging catalogue reads such a volume on with an empty one.
+    pub(super) fn main_missing(&self) -> bool {
+        self.main_missing
     }
 
     pub(super) fn end_record(&self) -> Option<super::RarEndRecord> {
@@ -892,11 +901,13 @@ impl Volume {
                 Ok(None) => {
                     if self.damaged_input.salvages()
                         && !self.damage_closed
-                        && self.format == RarFormat::Rar5
+                        && (self.format == RarFormat::Rar5
+                            || (catalogue_main && self.damaged_input == DamagedInput::Salvage))
                         && self.end_record.is_none()
                         && !self.encrypted_headers()
                     {
-                        // 7-Zip 26.06: "Unexpected end of archive" for a RAR 5.0 volume without its end header
+                        // 7-Zip 26.06: "Unexpected end of archive" for a RAR 5.0 volume without its end header; and
+                        // UnRAR 7.30 for a volume that ends where its main header should start (RAR 4.x too)
                         self.damage_closed = true;
                         self.record_damage(self.len, HeaderDamageKind::UnexpectedEnd, None, None);
                     }
@@ -1316,6 +1327,7 @@ mod tests {
             damage: Vec::new(),
             damage_closed: false,
             held_block: None,
+            main_missing: false,
             resync_work: None,
             cancel: None,
         };
@@ -1362,6 +1374,7 @@ mod tests {
             damage: Vec::new(),
             damage_closed: false,
             held_block: None,
+            main_missing: false,
             resync_work: None,
             cancel: None,
         };

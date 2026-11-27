@@ -157,10 +157,14 @@ impl<'a> Extraction<'a> {
         // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume is written from what is there;
         // one an archive cut short ends inside of always is, as UnRAR decodes it, its checks deciding (kept failed
         // with keep_broken, as `unrar x -kb` keeps it)
+        // a RAR 4.x file header cut short (HeaderCut::Header) is written under what of its name is there, as UnRAR
+        // 7.30 decodes it (kept with keep_broken, an empty file mostly, as `unrar x -kb` keeps it); not a folder, a
+        // symbolic link, or one without a name
         let blocked = member.issue.is_some_and(|issue| {
             let issue = &session.issues[issue];
             !((run.emit_unverified && super::cut_off(issue)) || super::cut_short(issue))
-        });
+        }) || (header.cut == Some(crate::rar5::HeaderCut::Header)
+            && (header.name.is_empty() || header.is_dir() || header.is_rar4_symlink()));
         if link.is_none() && (blocked || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }

@@ -315,7 +315,9 @@ What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut s
 | a RAR 4.x block's type byte changed (checksum fails, type unknown) | the block is passed over by its size, the rest extracted | "Headers Error" | `ChecksumMismatch`, passed over by its size |
 | a header that can't be read (size field changed, garbage inserted before it) | "Corrupt header is found" or "Unexpected end of archive", nothing after it is read, exit 3 | "Headers Error", stops | `Unreadable` (or `UnexpectedEnd`), the rest of the volume passed over, what came before stands |
 | the volume ends inside a file header's data (the header whole) | lists the member with its declared sizes; extracts it from the bytes there, reporting it OK when its checksum passes and "checksum error" (file removed, kept with `-kb`) when not; "Unexpected end of archive", exit 1 or 3 | lists it; "Data Error", a 0-byte file (stored data: the bytes there), exit 2 | as UnRAR: listed with its declared sizes, `UnexpectedEnd` with the name and `cut: Some(HeaderCut::Data { present })`; decoded as UnRAR decodes it (zeros read past the end), its checks deciding, in the runner and a `RarSession` alike (`keep_broken` keeps a failed one with UnRAR's bytes; a session fails it as `TruncatedData`) |
-| the volume ends inside a RAR 4.x file header (at least its 7 base bytes there) | lists an entry with the fields that are there, the rest zeros, and what of the name is there (possibly empty); "NAME - the file header is corrupt", exit 3; extracting it fails | lists nothing | as UnRAR: listed so, `UnexpectedEnd` with `cut: Some(HeaderCut::Header)`; extracting it fails (`TruncatedHeader`), nothing written |
+| the volume ends inside a RAR 4.x file header (at least its 7 base bytes there) | lists an entry with the fields that are there (a number not wholly there is 0, and the next field is read from its bytes) and what of the name is there (possibly empty); "NAME - the file header is corrupt", exit 3; extracting it fails, `-kb` keeping a file under that name with what decodes from no data (empty, mostly) | lists nothing | as UnRAR: listed so, `UnexpectedEnd` with `cut: Some(HeaderCut::Header)`; extracting it fails (`TruncatedHeader`); a `RarSession` with `keep_broken` keeps UnRAR's file (the runner writes nothing) |
+| a later volume cut inside its main header (its signature whole), or ending where it starts | "Main archive header is corrupt", "Unexpected end of archive"; goes on to the next volume | | as UnRAR in a `RarSession`: `UnexpectedEnd`, the set read on from the next volume |
+| a later volume whose first header (the next part of a split member) can't be read, is cut short, or isn't there | the split member ends where its data in the volume before did, decoded as a member cut short (zeros read on; "checksum error", kept with `-kb`); nothing of a later volume is joined to it, and the members after it are extracted | | as UnRAR in a `RarSession`: the member fails as `TruncatedData`, decoded so; its part in a later volume is an orphan continuation |
 | the volume ends inside any other header, a service header's data, or a RAR 5.0 file header | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
 | a RAR 5.0 volume without its end header | no message | "Unexpected end of archive", exit 2 | `UnexpectedEnd` at the volume's length |
 | only a member's data damaged | "checksum error", the rest extracted | "CRC Failed" | as before, with any `damaged_input`: the member fails, nothing is recorded as header damage |
@@ -394,15 +396,40 @@ missing end header):
   error in the encrypted file"), `keep_broken` keeping those bytes. The runner and a session do the same, rather
   than failing an incomplete cipher block before decoding. Not matched, of 96 cuts tried (every cut of two 48-byte
   members, `rar-long-password/a5-p-126.rar` and `short4-p-abc.rar`): 3 cuts with one whole block and 14 or 15
-  undecrypted bytes, where UnRAR prints one or a few more bytes of garbage than zipfast; both fail the member.
+  undecrypted bytes, where UnRAR prints one or a few more bytes of garbage than zipfast; both fail the member. The
+  same with `a4-p-126.rar` (RAR 3.x encryption, RAR 2.9 LZ): 7 cuts with one whole block and 9 to 15 undecrypted
+  bytes, where UnRAR decodes 3 to 15 bytes from code-length tables in those bytes that zipfast refuses (a run past
+  the table's end, then an oversubscribed table).
 - `HeaderCut::Header`: a RAR 4.x file header cut short, with at least the 7 bytes every header starts with. UnRAR
-  lists it with the fields that are there and zeros for the rest, its name what of it is there up to a NUL (empty
-  when none is), and fails it on extraction; zipfast does the same (`TruncatedHeader`; a `RarSession` member carries
-  it as its `payload_issue`). 7-Zip lists nothing: a caller showing 7-Zip's listing leaves out a `Header` cut, which
-  is always the last member of its volume. Not matched: when the cut falls inside the attributes field, UnRAR 7.30
-  shows the name as one space. `Salvage` only: under `Resync` a header the end seems to cut short is as likely one
-  whose size field is damaged, and the rest of the volume is searched past it instead (a header truly cut short ends
-  the volume there, as before).
+  7.30 reads its fields in order from the bytes there: a number (1, 2 or 4 bytes) not wholly there reads as 0 and
+  is not stepped over, so the next field is read from its bytes (`latest_winrar.rar` cut 13 bytes into `1.txt`'s
+  header lists packed size 17, size 0 and host OS "BeOS", the first byte of the unpacked size); a byte string (the
+  name, the salt, an extended time's fraction bytes) takes what of it is there and ends the bytes there. Its name is
+  what it read up to a NUL (empty when none; one space when the cut falls inside the attributes field, whose first
+  byte is 0x20). zipfast reads it the same way (`FileHeader` fields, `RarHeader`, `RarMember`, `Entry`) and fails it
+  on extraction (`TruncatedHeader`; a `RarSession` member carries it as its `payload_issue`). `unrar x -kb` still
+  writes a file under that name, holding what UnRAR decodes from no data (zeros read past the end): nothing for a
+  RAR 2.9 member, two bytes for `readme_154_normal.rar`'s RAR 1.5 `README.md` cut a byte before its header's end;
+  `unrar p` prints the same. A `RarSession` decodes it so too (testing, printing under `Emit`, extracting), always
+  failing it, and `keep_broken` keeps that file; not one without a name, a folder or a RAR 4.x symbolic link, nor
+  one whose fields name a version or method it can't unpack. The whole-archive runner writes nothing of it. 7-Zip
+  lists nothing: a caller showing 7-Zip's listing leaves out a `Header` cut, which is always the last member of its
+  volume. A continuation header cut short continues nothing (see the next paragraph). `Salvage` only: under `Resync`
+  a header the end seems to cut short is as likely one whose size field is damaged, and the rest of the volume is
+  searched past it instead (a header truly cut short ends the volume there, as before).
+
+A split member's next part is the first header UnRAR 7.30 reads in the next volume. When that volume's main header
+can't be read or is cut short (its signature whole), when its first header can't be read or is cut short, or when it
+holds no header, UnRAR ends the member where its data in the volume before ended, decodes it as a member cut short
+(zeros read on: `rar4-volumes/multi.part2.rar` cut anywhere before `file2.txt`'s data leaves 6,238 bytes of it, where
+a missing volume leaves 6,198), and goes on to the next volume, whose part of the member it joins to nothing, and
+extracts the members after it. A `RarSession` under `Salvage` does the same: the member fails as `TruncatedData`
+and is decoded so, its later part is an orphan continuation, and the catalogue reads on past a later volume whose
+main header can't be read. Not matched: a RAR 4.x continuation header cut inside its packed size (read as 0) whose
+flags say another part follows, which UnRAR takes as an empty part and continues from the volume after; a later
+volume cut inside its signature, where UnRAR stops with "Bad archive" (the catalogue fails to open); and RAR 5.0
+compressed members, whose decoded tail can be a few bytes short of UnRAR's (as below). The whole-archive runner
+joins as before.
 
 Every other header the end cuts short (a RAR 5.0 header, a service header or its data, fewer than 7 bytes of a RAR 4.x
 header) ends the volume as before. Progressive sessions don't read a cut member: they wait for bytes still to come,
@@ -549,7 +576,9 @@ runner (`extract::run` and the routes sharing it) reads it, and both decode it s
 its checks decide on those bytes, `keep_broken` keeps a failed one with them (the runner and `extract_selected`
 alike), a session reports it failed as `RarIntegrityReason::TruncatedData`, and `print_selected` prints a failed one
 under `Emit` only (a verified one prints as any other). RAR 3.x/4.x decoding feeds zeros after the data, and a PPMd
-or RAR 1.5/2.0 code starting past the byte after it is not decoded. For RAR 5.0 the length matches, but a symbol
+or RAR 1.5/2.0 code starting past the byte after it is not decoded; a RAR 2.9 match there reaching before the
+history copies zeros, as UnRAR's window holds (the "\0\0\0" ending `unrar p` prints of `rar4-volumes/multi.part1.rar`
+cut inside `file2.txt`). For RAR 5.0 the length matches, but a symbol
 straddling the end gives UnRAR bytes zeros don't, so the last few bytes can differ there. Such a member is decoded on
 the calling thread (UnRAR's cut needs the last symbols of each block, which workers don't note). In a volume set UnRAR
 then goes on to the members of the later volumes, and so do the runner and the session; the cut member's continuation
