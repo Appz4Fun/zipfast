@@ -386,8 +386,15 @@ missing end header):
   one as `TruncatedData`. Nothing continues it from a later volume, as UnRAR joins nothing to it: its part there is
   one without a start (`RarSkipReason::MissingStart` in the runner). 7-Zip reports a Data Error and leaves a 0-byte
   file whatever the checksum says (for stored data, the bytes there); a caller showing 7-Zip's outcome maps the
-  member's `UnexpectedEnd` record to that. A `SelectedEntry` (`7z x -so`) still streams the bytes there as it
-  decodes them.
+  member's `UnexpectedEnd` record to that. A `SelectedEntry` (`7z x -so`) takes no `DamagedInput` and reads as
+  under `Refuse`: the volume fails to open as truncated, so it never reads or joins such a member.
+  An encrypted member cut short inside a 16-byte cipher block is decoded the same way: UnRAR 7.30 (RAR 5.0 `-p` and
+  RAR 3.x encryption, compressed or stored) decrypts the whole blocks and hands the bytes of the block cut short on
+  undecrypted, to the decoder or, stored, to the file, then reads zeros; its checks decide, so it fails ("Checksum
+  error in the encrypted file"), `keep_broken` keeping those bytes. The runner and a session do the same, rather
+  than failing an incomplete cipher block before decoding. Not matched, of 96 cuts tried (every cut of two 48-byte
+  members, `rar-long-password/a5-p-126.rar` and `short4-p-abc.rar`): 3 cuts with one whole block and 14 or 15
+  undecrypted bytes, where UnRAR prints one or a few more bytes of garbage than zipfast; both fail the member.
 - `HeaderCut::Header`: a RAR 4.x file header cut short, with at least the 7 bytes every header starts with. UnRAR
   lists it with the fields that are there and zeros for the rest, its name what of it is there up to a NUL (empty
   when none is), and fails it on extraction; zipfast does the same (`TruncatedHeader`; a `RarSession` member carries

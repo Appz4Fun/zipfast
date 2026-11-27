@@ -33,7 +33,7 @@ use crate::output::{Output, temporary};
 use crate::path::sanitize;
 use crate::rar5::member::{CipherBlocks, MemberMachine, PendingCipher};
 use crate::rar5::reader::{Block, ReadDataError, SIGNATURE_PROBE_BYTES, Volume, signature_end};
-use crate::rar5::unpack::rar4::{CUT_PAD, Rar4DecodeError, Rar4Decoder};
+use crate::rar5::unpack::rar4::{CUT_HELD_MAX, CUT_PAD, Rar4DecodeError, Rar4Decoder};
 use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 use crate::rar5::{FileHeader, MemberCrypt, RarFormat, Redirection};
 use crate::volume::next_volume;
@@ -4125,23 +4125,24 @@ pub(crate) fn rar4_part_decoder(
     Ok(decoder)
 }
 
-/// The most a member cut short may decode from the zeros it is read on with ([`emit_cut_short`]) before what came of
-/// them is cut where UnRAR stops: past it the rest is left out.
-const CUT_HELD_MAX: u64 = 64 << 20;
-
 /// [`Run::reads_past_cut`]: the data of a member the archive's end cuts short has all been fed; what UnRAR 7.30 `x -kb`
 /// and `p` decode of it goes to `p` too, as [`crate::rar5::session::RarSession`] hands it over: a RAR 3.x/4.x decoder
 /// is fed zeros past the end, every code starting before the byte after the data decoding; a RAR 5.0 one decodes
-/// every symbol starting before the end. What decodes before a damaged code stands; only a failure writing it (the
-/// sink's) is returned.
+/// every symbol starting before the end. An encrypted member's last cipher block cut short isn't decrypted: UnRAR
+/// hands its bytes on as they are (to the decoder, or to the file if stored), so no incomplete block fails it here.
+/// What decodes before a damaged code stands; only a failure writing it (the sink's) is returned.
 fn emit_cut_short(
     p: &mut Pending,
     rar4: Option<&mut Rar4Decoder>,
     stream: Option<&mut Unpacker>,
 ) -> std::result::Result<(), RarFault> {
+    let (raw, mut blocks) = match p.cipher.as_mut() {
+        Some(cipher) => (std::mem::take(&mut cipher.rem), cipher.blocks.take()),
+        None => (Vec::new(), None),
+    };
+    let stored = !p.compressed;
     let mut sink = PendingSink { pending: p, fault: None };
     if let Some(decoder) = rar4 {
-        decoder.cut_short();
         let before = sink.pending.bytes;
         // held until the cut is known, no more than the member may still produce
         let declared = sink.pending.declared.map_or(CUT_HELD_MAX, |size| size.saturating_sub(before));
@@ -4155,7 +4156,9 @@ fn emit_cut_short(
             held.extend_from_slice(bytes);
             Ok(())
         };
-        if decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
+        let fed = decoder.feed(&raw, &mut keep).is_ok();
+        decoder.cut_short();
+        if fed && decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
             let _ = decoder.drain(&mut keep);
         }
         let take = usize::try_from(decoder.cut_point().saturating_sub(before)).unwrap_or(usize::MAX).min(held.len());
@@ -4163,7 +4166,15 @@ fn emit_cut_short(
             let _ = decoder.flush_decoded(&mut sink);
         }
     } else if let Some(stream) = stream {
-        let _ = stream.flush_cut(&mut sink);
+        let fed = match blocks.as_mut() {
+            Some(blocks) => blocks.feed(&raw, stream, &mut sink),
+            None => stream.feed(&raw, &mut sink),
+        };
+        if fed.is_ok() {
+            let _ = stream.flush_cut(&mut sink);
+        }
+    } else if stored {
+        let _ = sink.put(&raw);
     }
     match sink.fault {
         Some(fault) => Err(fault),
@@ -5125,7 +5136,8 @@ impl Run<'_, '_, '_> {
     /// [`DamagedInput::Salvage`]: whether `h` is a member the end of an archive cut short ends inside the data of
     /// ([`crate::rar5::HeaderCut::Data`]), decoded on this thread as UnRAR 7.30 decodes it, reading on past the end as
     /// zeros ([`emit_cut_short`]): its checks decide on those bytes, as UnRAR's do, and a file kept with
-    /// [`Options::keep_broken`] holds what `unrar x -kb` keeps. Not for a `SelectedEntry`, which streams as before.
+    /// [`Options::keep_broken`] holds what `unrar x -kb` keeps. A `SelectedEntry` never meets one (it reads as under
+    /// [`DamagedInput::Refuse`]).
     fn reads_past_cut(&self, h: &FileHeader) -> bool {
         self.selection.is_none() && matches!(h.cut, Some(crate::rar5::HeaderCut::Data { .. }))
     }
@@ -6147,7 +6159,8 @@ impl Run<'_, '_, '_> {
     /// Reads this volume's part of a file and, at its last part, checks and finishes it.
     fn continue_file(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending, crypt: MemberCrypt) -> RunResult<()> {
         // DamagedInput::Salvage: nothing continues a member the archive's end cuts short, as UnRAR 7.30 joins nothing
-        // to it (its part in a later volume is one without a start)
+        // to it (its part in a later volume is one without a start). A `SelectedEntry` never meets one: it reads as
+        // under DamagedInput::Refuse, where the volume fails as truncated instead
         let split_after = h.split_after() && h.cut.is_none();
         let cut_short = self.reads_past_cut(h);
         if p.failed {
@@ -6310,7 +6323,8 @@ impl Run<'_, '_, '_> {
                         .map_err(|e| decoder_fault(e, &p, None)),
                     None => Ok(()),
                 };
-                padding.and_then(|()| {
+                // a member cut short: its last cipher block's bytes go on undecrypted (emit_cut_short)
+                if cut_short { Ok(()) } else { padding }.and_then(|()| {
                     if cut_short {
                         // its checks decide below, on what UnRAR decodes of it
                         emit_cut_short(&mut p, rar4.as_mut(), stream.as_mut())

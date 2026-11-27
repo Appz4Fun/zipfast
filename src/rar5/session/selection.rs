@@ -24,7 +24,7 @@ use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 use super::*;
 use crate::rar5::RarFormat;
-use crate::rar5::unpack::rar4::{CUT_PAD, Rar4DecodeError, Rar4Decoder};
+use crate::rar5::unpack::rar4::{CUT_HELD_MAX, CUT_PAD, Rar4DecodeError, Rar4Decoder};
 
 #[cfg(unix)]
 pub(super) mod control;
@@ -518,6 +518,11 @@ impl SelectedRun {
                     self.failed = Some((predecessor, failure));
                     return Ok(RarOutcome::Failed(history_failure(self.failed.as_ref())));
                 }
+                // a predecessor that passed may still end the chain's history (one an archive cut short)
+                if self.failed.is_some() {
+                    self.next = predecessor + 1;
+                    return Ok(RarOutcome::Failed(history_failure(self.failed.as_ref())));
+                }
             }
             self.next = index + 1;
         }
@@ -818,6 +823,12 @@ impl SelectedRun {
             }
         }
         if let Some(issue) = cut {
+            // the archive cut short inside a cipher block: UnRAR 7.30 decrypts only whole blocks and hands the bytes of
+            // the one cut short on undecrypted (to the decoder, or to the file if stored), then reads zeros
+            let (raw, mut blocks) = match pending.selected_cipher().filter(|_| cut_short) {
+                Some(cipher) => (std::mem::take(&mut cipher.rem), cipher.take_blocks()),
+                None => (Vec::new(), None),
+            };
             // what the decoder holds of the volumes there goes out, as UnRAR 7.30 `p` and `x -kb` write it
             let mut sink = SelectedSink {
                 pending: &mut pending,
@@ -829,11 +840,12 @@ impl SelectedRun {
             };
             if let Some(decoder) = rar4.as_mut() {
                 if cut_short {
-                    // UnRAR reads zeros past the end: what decodes from them is held until the cut is known
-                    decoder.cut_short();
                     let before = sink.pending.bytes;
+                    // held as the runner holds it (no more than the member may still produce, nor CUT_HELD_MAX), and
                     // no more than the decoded bytes the selection may still take: the sink refuses the rest anyway
-                    let room = usize::try_from(sink.limit.saturating_sub(*sink.decoded)).unwrap_or(usize::MAX);
+                    let declared = member.unpacked_size.map_or(CUT_HELD_MAX, |size| size.saturating_sub(before));
+                    let budget = sink.limit.saturating_sub(*sink.decoded);
+                    let room = usize::try_from(declared.min(CUT_HELD_MAX).min(budget)).unwrap_or(usize::MAX);
                     let mut held = Vec::new();
                     let mut keep = |bytes: &[u8]| -> crate::Result<()> {
                         if bytes.len() > room - held.len() {
@@ -843,8 +855,12 @@ impl SelectedRun {
                         held.extend_from_slice(bytes);
                         Ok(())
                     };
-                    // what decodes before a damaged code stands: the member fails anyway
-                    if decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
+                    // the data ends after the cipher block cut short; UnRAR reads zeros past it: what decodes from
+                    // them is held until the cut is known. What decodes before a damaged code stands: the member fails
+                    // anyway
+                    let fed = decoder.feed(&raw, &mut keep).is_ok();
+                    decoder.cut_short();
+                    if fed && decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
                         let _ = decoder.drain(&mut keep);
                     }
                     let end = decoder.cut_point();
@@ -857,7 +873,20 @@ impl SelectedRun {
                 let result = decoder.flush_decoded(&mut sink);
                 sink.finish_rar4(result)?;
             } else if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
-                let result = decoder.flush_cut(&mut sink);
+                let fed = match blocks.as_mut() {
+                    Some(blocks) => blocks.feed(&raw, decoder, &mut sink),
+                    None => decoder.feed(&raw, &mut sink),
+                };
+                // what decodes before a damaged code stands
+                if fed.is_ok() {
+                    let result = decoder.flush_cut(&mut sink);
+                    sink.finish(result, None)?;
+                } else if let Some(failure) = sink.failure.take() {
+                    return Err(failure);
+                }
+            } else if !compressed && !raw.is_empty() {
+                // stored: written as they are (no further than the declared size, as the sink takes no more)
+                let result = sink.put(&raw);
                 sink.finish(result, None)?;
             }
             if !cut_short {

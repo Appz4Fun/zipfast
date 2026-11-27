@@ -623,3 +623,82 @@ fn a_solid_member_after_a_cut_one_that_passes_has_no_history() {
     let summary = session.test_selected(&selected, RarDecodeLimits::default(), |_| {}).unwrap();
     assert_eq!((summary.files, summary.failed), (0, 1));
 }
+
+/// RAR 4.x's low 16 bits of the CRC32 of a block from its type byte on.
+fn rar4_header_crc(block: &mut [u8]) {
+    let crc = hash(&block[2..]) as u16;
+    block[..2].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// [`a_solid_member_after_a_cut_one_that_passes_has_no_history`] for RAR 4.x: `rar4/solid.rar` (`tese.txt`, then
+/// `unrardll.txt` solid after it) cut 100 bytes short of `tese.txt`'s data end, as `x.part1.rar`, then `x.part2.rar`
+/// holding `unrardll.txt` (both marked volumes, new naming). `tese.txt`'s header declares what UnRAR decodes of it
+/// there, so it tests good. `unrardll.txt` selected alone decodes `tese.txt` first, then fails as one whose history is
+/// lost, and the run goes on, rather than ending on a decoder it has no stream for.
+#[test]
+fn a_rar4_solid_member_after_a_cut_one_that_passes_has_no_history() {
+    let solid = fixture("rar4/solid.rar");
+    // the marker (7 bytes), the main header (13), tese.txt's header (45) and data (448), then unrardll.txt
+    let (main, a_header, a_end) = (7usize, 20usize, 513usize);
+    assert_eq!(&solid[a_header + 32..a_header + 40], b"tese.txt");
+    assert_eq!(&solid[a_end + 32..a_end + 44], b"unrardll.txt");
+    assert_eq!(u16::from_le_bytes([solid[a_end + 3], solid[a_end + 4]]) & 0x0010, 0x0010, "unrardll.txt is solid");
+    let mut volume = solid.clone();
+    // MHD_VOLUME | MHD_NEWNUMBERING beside MHD_SOLID
+    volume[main + 3] |= 0x11;
+    rar4_header_crc(&mut volume[main..a_header]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut part2 = volume[..a_header].to_vec();
+    part2.extend_from_slice(&volume[a_end..]);
+    fs::write(dir.path().join("x.part2.rar"), &part2).unwrap();
+
+    let first = dir.path().join("x.part1.rar");
+    let mut part1 = volume[..a_end - 100].to_vec();
+    fs::write(&first, &part1).unwrap();
+    let salvage = RarSessionOptions { damaged_input: DamagedInput::Salvage, ..Default::default() };
+    let mut session = RarSession::open(&first, None, salvage.clone()).unwrap();
+    let selected = session.select(|m| m.name() == "tese.txt").unwrap();
+    let mut decoded = Vec::new();
+    let print = RarPrintOptions { unverified_output: UnverifiedOutput::Emit, ..RarPrintOptions::default() };
+    let _ = session.print_selected(&selected, &mut decoded, &print, |_| {});
+    assert!(!decoded.is_empty());
+    // tese.txt's unpacked size (after the packed size), then its CRC (after the host OS byte)
+    let unpacked_at = a_header + 11;
+    part1[unpacked_at..unpacked_at + 4].copy_from_slice(&(decoded.len() as u32).to_le_bytes());
+    part1[unpacked_at + 5..unpacked_at + 9].copy_from_slice(&hash(&decoded).to_le_bytes());
+    rar4_header_crc(&mut part1[a_header..a_end - 448]);
+    fs::write(&first, &part1).unwrap();
+
+    let history = |f: &RarFailure| matches!(f, RarFailure::SolidHistoryUnavailable { .. });
+    let mut session = RarSession::open(&first, None, salvage.clone()).unwrap();
+    let names: Vec<String> = session.entries().map(|m| m.name().to_owned()).collect();
+    assert_eq!(names, ["tese.txt", "unrardll.txt"]);
+    let selected = session.select(|_| true).unwrap();
+    let mut outcomes = Vec::new();
+    session
+        .test_selected(&selected, RarDecodeLimits::default(), |event| {
+            outcomes.push(match &event.outcome {
+                RarOutcome::Verified { .. } => "verified",
+                RarOutcome::Failed(f) if history(f) => "history",
+                _ => "other",
+            })
+        })
+        .unwrap();
+    assert_eq!(outcomes, ["verified", "history"]);
+    // unrardll.txt alone: its predecessor decoded first, then the same, and the run carries on
+    let mut session = RarSession::open(&first, None, salvage).unwrap();
+    let selected = session.select(|m| m.name() == "unrardll.txt").unwrap();
+    let mut outcomes = Vec::new();
+    let summary = session
+        .test_selected(&selected, RarDecodeLimits::default(), |event| {
+            outcomes.push(matches!(&event.outcome, RarOutcome::Failed(f) if history(f)))
+        })
+        .unwrap();
+    assert_eq!(outcomes, [true]);
+    assert_eq!((summary.files, summary.failed), (0, 1));
+    // the runner too
+    let out = dir.path().join("out");
+    let summary = extract::run(&first, &options(&out, Mode::Test, DamagedInput::Salvage), |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("unrardll.txt"), "{:?}", summary.errors);
+}

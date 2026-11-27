@@ -308,6 +308,29 @@ fn a_member_cut_short_is_not_continued_from_the_next_volume() {
     assert_eq!(sha256(&output), "41cf0cc0b9c6a62ca032a319c7eb30115240e95775c4bbe4ddf858b628cee6ae");
 }
 
+/// A `SelectedEntry` (which takes no `DamagedInput` and reads as under `Refuse`) never reads a member the archive's end
+/// cuts short: the first volume of `rar5-threads/big` cut inside `a.txt`, with the later volumes there, fails to open as
+/// truncated, so nothing joins the continuation in the second volume to it either.
+#[test]
+fn a_selected_entry_does_not_read_a_member_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = Path::new(FIXTURES).join("rar5-threads");
+    let first = dir.path().join("big.part01.rar");
+    fs::write(&first, &fs::read(set.join("big.part01.rar")).unwrap()[..70_000]).unwrap();
+    for later in ["big.part02.rar", "big.part03.rar"] {
+        fs::copy(set.join(later), dir.path().join(later)).unwrap();
+    }
+    let mut data = Vec::new();
+    let read = zipfast::extract::SelectedEntry::open(&first, 0, None, 1 << 30).and_then(|entry| {
+        entry.read(None, |bytes| {
+            data.extend_from_slice(bytes);
+            Ok(())
+        })
+    });
+    assert!(matches!(read, Err(zipfast::Error::Truncated)), "{read:?}");
+    assert!(data.is_empty(), "{} bytes", data.len());
+}
+
 /// The second volume of `rar5-threads/big` cut 70,000 bytes in, inside the part of `a.txt` it continues: `unrar x -kb`
 /// keeps 2,950,048 bytes of `a.txt` (what `unrar p` prints; its last bytes are where a RAR 5.0 symbol straddling the
 /// end decodes differently from zeros). The runner keeps that many, the same bytes on one thread and on several (where
@@ -336,5 +359,128 @@ fn whole_archive_run_keeps_what_unrar_decodes_of_a_continuation_cut_short() {
             assert_eq!(a.len(), printed.len(), "{what}");
             assert!(a == printed, "{what}: the bytes the session prints");
         }
+    }
+}
+
+/// An encrypted member the archive cuts short, where it is cut, and what `unrar p -p<password>` prints (hex).
+const ENCRYPTED_CUTS: &[(&str, usize, &str)] = &[
+    // RAR 5.0 (`-p`), 48 packed bytes from 112: cut inside the last cipher block too
+    (A5, 112, ""),
+    (A5, 128, ""),
+    (A5, 144, "68656c6c6f206c6f6e672070617373776f726420"),
+    (A5, 145, "68656c6c6f206c6f6e672070617373776f726420202020"),
+    (A5, 150, "68656c6c6f206c6f6e672070617373776f726420202020747372736e2064"),
+    (A5, 159, "68656c6c6f206c6f6e672070617373776f726420202020747372736e2064"),
+    // RAR 3.x encryption (RAR 4.x `-p`), 48 packed bytes from 70
+    (R4ABC, 70, ""),
+    (R4ABC, 86, ""),
+    (R4ABC, 102, "68656c6c6f206c6f6e672070617373776f7264207465737420202020"),
+    (R4ABC, 103, "68656c6c6f206c6f6e672070617373776f726420746573742074200a2020"),
+    (R4ABC, 110, "68656c6c6f206c6f6e672070617373776f726420746573742074206e6f64"),
+    (R4ABC, 117, "68656c6c6f206c6f6e672070617373776f726420746573742074206e6f64"),
+];
+const A5: &str = "rar-long-password/a5-p-126.rar";
+const R4ABC: &str = "rar-long-password/short4-p-abc.rar";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An encrypted member cut short, at a multiple of the 16-byte cipher block or not: UnRAR 7.30 decrypts the whole
+/// blocks and hands the bytes of the one cut short on undecrypted, then reads zeros, and its checks decide (all fail
+/// here: "checksum error in the encrypted file"). `RarSession::print_selected` prints, and the whole-archive runner
+/// keeps with `keep_broken`, the same bytes, and both fail the member, rather than the runner failing an incomplete
+/// cipher block before decoding it.
+#[test]
+fn an_encrypted_member_cut_short_decodes_as_unrar_decodes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let pw126 = fs::read_to_string(Path::new(FIXTURES).join("rar-long-password/pw126.txt")).unwrap();
+    for &(archive, at, unrar) in ENCRYPTED_CUTS {
+        let what = format!("{archive}@{at}");
+        let password = if archive == A5 { pw126.as_str() } else { "abc" };
+        let bytes = fs::read(Path::new(FIXTURES).join(archive)).unwrap();
+        let path = dir.path().join(format!("{at}-{}", Path::new(archive).file_name().unwrap().to_string_lossy()));
+        fs::write(&path, &bytes[..at]).unwrap();
+        let mut session = RarSession::open(&path, Some(password), salvaging()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let mut printed = Vec::new();
+        let mut failed = Vec::new();
+        for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+            let print = RarPrintOptions { unverified_output: unverified, ..RarPrintOptions::default() };
+            printed.clear();
+            session
+                .print_selected(&all, &mut printed, &print, |event| {
+                    if let RarOutcome::Failed(failure) = &event.outcome {
+                        failed.push(truncated(failure));
+                    }
+                })
+                .unwrap();
+        }
+        assert_eq!(failed, [true, true], "{what}: the session fails it as truncated");
+        // Withhold prints nothing of a failing member
+        assert!(printed.is_empty(), "{what}");
+        let mut session = RarSession::open(&path, Some(password), salvaging()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let print = RarPrintOptions { unverified_output: UnverifiedOutput::Emit, ..RarPrintOptions::default() };
+        session.print_selected(&all, &mut printed, &print, |_| {}).unwrap();
+        assert_eq!(hex(&printed), unrar, "{what}: the session prints UnRAR's bytes");
+        for threads in [1, 4] {
+            let out = dir.path().join(format!("run-{at}-{threads}"));
+            let options = Options { threads: Some(threads), ..options(&out, UnverifiedOutput::Withhold) };
+            let summary = zipfast::extract::run_with_password(&path, &options, Some(password), |_| {}).unwrap();
+            assert_eq!(summary.errors.len(), 1, "{what}: {:?}", summary.errors);
+            assert!(summary.errors[0].contains("f.txt"), "{what}: {:?}", summary.errors);
+            let kept = fs::read(out.join("f.txt")).unwrap();
+            assert_eq!(hex(&kept), unrar, "{what}: the runner keeps UnRAR's bytes ({threads} threads)");
+        }
+    }
+}
+
+/// `rar4-archiver/win-encvol` (`-m0 -p`, AES-128, four volumes) with its last volume cut short: UnRAR 7.30 writes the
+/// stored member's whole cipher blocks decrypted and then the bytes of the block cut short as they are (`unrar p`:
+/// length and SHA-256), and fails it on its checksum. The runner and a session keep the same.
+#[test]
+fn a_stored_encrypted_member_cut_short_keeps_its_last_block_as_unrar_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let cuts: [(usize, usize, &str); 3] = [
+        (120, 2764, "07a16e1438d0de59300fd97a5ab263d1a1c0940868634680e40bae68574b175f"),
+        (140, 2784, "e4533ac2c3155fdf2dbc424ae0d74c9ca18063dc3f2730ff726f6e7ffc0b1480"),
+        (150, 2794, "380e2af5ce82ea506edc4db0e363e0c47c875146f919c3eea9e731571ae802da"),
+    ];
+    for (at, len, sha) in cuts {
+        let set = dir.path().join(format!("set-{at}"));
+        fs::create_dir_all(&set).unwrap();
+        for name in ["win-encvol.rar", "win-encvol.r00", "win-encvol.r01", "win-encvol.r02"] {
+            let bytes = fs::read(Path::new(FIXTURES).join("rar4-archiver").join(name)).unwrap();
+            let bytes = if name.ends_with("r02") { &bytes[..at] } else { &bytes[..] };
+            fs::write(set.join(name), bytes).unwrap();
+        }
+        let first = set.join("win-encvol.rar");
+        let what = format!("win-encvol.r02@{at}");
+        let out = dir.path().join(format!("run-{at}"));
+        let summary = zipfast::extract::run_with_password(
+            &first,
+            &options(&out, UnverifiedOutput::Withhold),
+            Some("testpw123"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(summary.errors.len(), 1, "{what}: {:?}", summary.errors);
+        let kept = fs::read(out.join("split.bin")).unwrap();
+        assert_eq!((kept.len(), sha256(&kept).as_str()), (len, sha), "{what}: the runner");
+        let session_out = dir.path().join(format!("session-{at}"));
+        let mut session = RarSession::open(&first, Some("testpw123"), salvaging()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session
+            .extract_selected(
+                &all,
+                &options(&session_out, UnverifiedOutput::Withhold),
+                RarDecodeLimits::default(),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary.failed, 1, "{what}");
+        let kept = fs::read(session_out.join("split.bin")).unwrap();
+        assert_eq!((kept.len(), sha256(&kept).as_str()), (len, sha), "{what}: the session");
     }
 }
