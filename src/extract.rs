@@ -6207,6 +6207,7 @@ impl Run<'_, '_, '_> {
             && h.packed_size >= batch::STORED_PARALLEL_MIN
             && p.blake.is_none()
             && part_blake.is_none()
+            && h.cut.is_none()
         {
             return self.stored_parallel(vol, h, p);
         }
@@ -6216,9 +6217,12 @@ impl Run<'_, '_, '_> {
         {
             stream.track_tail();
             if cut_short {
-                // UnRAR's cut at the data's end needs the last symbols of each block, which workers don't note
                 stream.set_cut_short(true);
-                stream.serial_file();
+                // decoded on this thread from its first byte (a continuation's earlier parts may be with the workers,
+                // which mark their blocks' last symbols for the cut instead)
+                if !h.split_before() {
+                    stream.serial_file();
+                }
             }
         }
         let mut rar4_error = None;

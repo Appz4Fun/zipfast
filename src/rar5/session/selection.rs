@@ -864,9 +864,12 @@ impl SelectedRun {
                 return Err(copy_catalogue_issue(issue));
             }
             // the archive cut short: what UnRAR decodes of the member is checked as UnRAR checks it (`decode_bound`
-            // fails it as the cut when that fails); its decoder goes no further
+            // fails it as the cut when that fails); no history goes on from what was decoded past the end, so a solid
+            // member after it fails as one whose history is lost, whatever these checks say
             if compressed {
                 self.decoder = None;
+                self.rar4 = None;
+                self.failed = Some((index, Arc::new(copy_catalogue_issue(issue))));
             }
             let final_checks = parts.last().expect("catalogue members have a part").checks;
             let checks = pending.verify_selected(
@@ -978,7 +981,10 @@ impl SelectedRun {
     ) -> Result<(), RarFailure> {
         let header = &member.header;
         if header.solid {
-            let decoder = self.decoder.as_mut().expect("solid predecessors decoded");
+            // a chain whose history ended (at a member an archive cut short, say) has no decoder to go on with
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Err(copy_history_failure(&history_failure(self.failed.as_ref())));
+            };
             if header.dictionary > decoder.reach() {
                 return Err(RarFailure::Limit {
                     resource: RarResource::DictionarySize,
@@ -1109,6 +1115,16 @@ fn is_terminal(failure: &RarFailure) -> bool {
                 ..
             }
     )
+}
+
+/// [`history_failure`], owned.
+fn copy_history_failure(failure: &RarFailure) -> RarFailure {
+    match failure {
+        RarFailure::SolidHistoryUnavailable { predecessor, cause } => {
+            RarFailure::SolidHistoryUnavailable { predecessor: *predecessor, cause: cause.clone() }
+        }
+        _ => RarFailure::Internal(RarInternal::Invariant("unexpected history failure")),
+    }
 }
 
 fn history_failure(failed: Option<&(usize, Arc<RarFailure>)>) -> Arc<RarFailure> {

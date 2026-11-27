@@ -2080,7 +2080,13 @@ impl Unpacker {
             }
         }
         self.ended = true;
-        self.flush(sink)
+        self.flush(sink)?;
+        // what came out is checked as a whole file is (a member an archive cut short can pass), so a sink taking the
+        // file's CRC32 from the decoder gets it
+        if sink.wants_crc() {
+            sink.crc(self.crc.finish());
+        }
+        Ok(())
     }
 
     /// The data ends because the archive is cut short there, not at a missing volume: UnRAR reads on past the end

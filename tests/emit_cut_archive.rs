@@ -307,3 +307,34 @@ fn a_member_cut_short_is_not_continued_from_the_next_volume() {
     assert_eq!(output.len(), 930_716);
     assert_eq!(sha256(&output), "41cf0cc0b9c6a62ca032a319c7eb30115240e95775c4bbe4ddf858b628cee6ae");
 }
+
+/// The second volume of `rar5-threads/big` cut 70,000 bytes in, inside the part of `a.txt` it continues: `unrar x -kb`
+/// keeps 2,950,048 bytes of `a.txt` (what `unrar p` prints; its last bytes are where a RAR 5.0 symbol straddling the
+/// end decodes differently from zeros). The runner keeps that many, the same bytes on one thread and on several (where
+/// the first volume's part goes to the workers before the cut is known), and the same as the session prints.
+#[test]
+fn whole_archive_run_keeps_what_unrar_decodes_of_a_continuation_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = Path::new(FIXTURES).join("rar5-threads");
+    let first = dir.path().join("big.part01.rar");
+    fs::copy(set.join("big.part01.rar"), &first).unwrap();
+    fs::write(dir.path().join("big.part02.rar"), &fs::read(set.join("big.part02.rar")).unwrap()[..70_000]).unwrap();
+    let mut session = RarSession::open(&first, None, salvaging()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let print = RarPrintOptions { unverified_output: UnverifiedOutput::Emit, ..RarPrintOptions::default() };
+    let mut printed = Vec::new();
+    session.print_selected(&all, &mut printed, &print, |_| {}).unwrap();
+    assert_eq!(printed.len(), 2_950_048);
+    for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+        for threads in [1, 4] {
+            let what = format!("{unverified:?} threads {threads}");
+            let out = dir.path().join(format!("out-{unverified:?}-{threads}"));
+            let options = Options { threads: Some(threads), parallel_min: Some(1 << 16), ..options(&out, unverified) };
+            let summary = zipfast::extract::run(&first, &options, |_| {}).unwrap();
+            assert!(summary.errors.iter().any(|error| error.contains("a.txt")), "{what}: {:?}", summary.errors);
+            let a = fs::read(out.join("a.txt")).unwrap();
+            assert_eq!(a.len(), printed.len(), "{what}");
+            assert!(a == printed, "{what}: the bytes the session prints");
+        }
+    }
+}

@@ -501,3 +501,125 @@ fn salvage_passes_over_an_unselected_cut_header_in_a_solid_archive() {
         assert_eq!(summary.damaged_headers[0].cut, Some(HeaderCut::Header), "cut at {len}");
     }
 }
+
+/// A RAR 5.0 vint at `at`: its value and the offset after it.
+fn vint(bytes: &[u8], mut at: usize) -> (u64, usize) {
+    let (mut value, mut shift) = (0u64, 0);
+    loop {
+        let byte = bytes[at];
+        value |= u64::from(byte & 0x7f) << shift;
+        at += 1;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            return (value, at);
+        }
+    }
+}
+
+/// `rar5-threads/solid.rar` cut 100 bytes short of `b.txt`'s data end, as `x.part1.rar`, with no end header, so the
+/// session goes on to `x.part2.rar` (both marked volumes): the main header, then `c.txt` (solid, its history `b.txt`'s) and the end header.
+/// `b.txt`'s header is patched to declare the size and CRC of what UnRAR decodes of it there, so it tests good; `c.txt`
+/// then fails as one whose history is lost (nothing goes on from a member decoded past the end), rather than the session
+/// going on without a decoder.
+#[test]
+fn a_solid_member_after_a_cut_one_that_passes_has_no_history() {
+    let solid = fixture("rar5-threads/solid.rar");
+    let dir = tempfile::tempdir().unwrap();
+    let whole = dir.path().join("solid.rar");
+    fs::write(&whole, &solid).unwrap();
+    let session = RarSession::open(&whole, None, RarSessionOptions::default()).unwrap();
+    let headers: Vec<(String, u64, u64)> = session
+        .volume_headers(0)
+        .map(|h| (h.name().to_owned(), h.data_offset(), h.data_offset() + h.packed_size()))
+        .collect();
+    // the members, then the quick open record, then the end header
+    assert_eq!(headers.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["b.txt", "c.txt", "d.txt", "s.txt", "QO"]);
+    let (b_end, c_end, last_end) = (headers[0].2 as usize, headers[1].2 as usize, headers[4].2 as usize);
+    // the signature and the main header: its CRC, then its size
+    let (size, after) = vint(&solid, 12);
+    let main_end = after + size as usize;
+    // marked a volume (archive flag 0x0001), so the session looks for the next one where the first ends early
+    let mut volume = solid.clone();
+    let (_, at) = vint(&volume, after);
+    let (header_flags, mut at) = vint(&volume, at);
+    if header_flags & 1 != 0 {
+        at = vint(&volume, at).1;
+    }
+    assert_eq!(volume[at] & 0x81, 0, "one-byte archive flags, not yet a volume");
+    volume[at] |= 1;
+    let main_crc = hash(&volume[12..main_end]);
+    volume[8..12].copy_from_slice(&main_crc.to_le_bytes());
+    let solid = volume;
+    let mut part2 = solid[..main_end].to_vec();
+    part2.extend_from_slice(&solid[b_end..c_end]);
+    part2.extend_from_slice(&solid[last_end..]);
+    fs::write(dir.path().join("x.part2.rar"), &part2).unwrap();
+
+    let first = dir.path().join("x.part1.rar");
+    let mut part1 = solid[..b_end - 100].to_vec();
+    fs::write(&first, &part1).unwrap();
+    let salvage = RarSessionOptions { damaged_input: DamagedInput::Salvage, ..Default::default() };
+    let mut session = RarSession::open(&first, None, salvage.clone()).unwrap();
+    let selected = session.select(|m| m.name() == "b.txt").unwrap();
+    let mut decoded = Vec::new();
+    let print = RarPrintOptions { unverified_output: UnverifiedOutput::Emit, ..RarPrintOptions::default() };
+    session.print_selected(&selected, &mut decoded, &print, |_| {}).unwrap();
+    assert!(!decoded.is_empty());
+    // b.txt's header: CRC, size, type, flags, [extra size], [data size], file flags, unpacked size,
+    // attributes, [mtime], data CRC
+    let header = main_end;
+    let (size, fields) = vint(&part1, header + 4);
+    let header_end = fields + size as usize;
+    let (_, at) = vint(&part1, fields);
+    let (flags, mut at) = vint(&part1, at);
+    if flags & 1 != 0 {
+        at = vint(&part1, at).1;
+    }
+    if flags & 2 != 0 {
+        at = vint(&part1, at).1;
+    }
+    let (file_flags, unpacked_at) = vint(&part1, at);
+    let (_, after_unpacked) = vint(&part1, unpacked_at);
+    assert_eq!(file_flags & 0x0004, 0x0004, "b.txt has a data CRC");
+    // the decoded length in a vint as wide as the declared size's
+    let width = after_unpacked - unpacked_at;
+    let len = decoded.len() as u64;
+    assert!(len < 1 << (7 * width));
+    for (k, byte) in part1[unpacked_at..after_unpacked].iter_mut().enumerate() {
+        *byte = (len >> (7 * k)) as u8 & 0x7f | if k + 1 < width { 0x80 } else { 0 };
+    }
+    let (_, mut crc_at) = vint(&part1, after_unpacked);
+    if file_flags & 0x0002 != 0 {
+        crc_at += 4;
+    }
+    part1[crc_at..crc_at + 4].copy_from_slice(&hash(&decoded).to_le_bytes());
+    let header_crc = hash(&part1[header + 4..header_end]);
+    part1[header..header + 4].copy_from_slice(&header_crc.to_le_bytes());
+    fs::write(&first, &part1).unwrap();
+
+    let mut session = RarSession::open(&first, None, salvage.clone()).unwrap();
+    let names: Vec<String> = session.entries().map(|m| m.name().to_owned()).collect();
+    assert_eq!(names, ["b.txt", "c.txt"]);
+    let selected = session.select(|_| true).unwrap();
+    let mut outcomes = Vec::new();
+    session
+        .test_selected(&selected, RarDecodeLimits::default(), |event| {
+            outcomes.push(match &event.outcome {
+                RarOutcome::Verified { .. } => "verified",
+                RarOutcome::Failed(f) if matches!(f.as_ref(), RarFailure::SolidHistoryUnavailable { .. }) => "history",
+                _ => "other",
+            })
+        })
+        .unwrap();
+    assert_eq!(outcomes, ["verified", "history"]);
+    // the runner too
+    let out = dir.path().join("out");
+    let summary = extract::run(&first, &options(&out, Mode::Test, DamagedInput::Salvage), |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("c.txt"), "{:?}", summary.errors);
+    // c.txt alone: its predecessor decoded first, then the same
+    let mut session = RarSession::open(&first, None, salvage).unwrap();
+    let selected = session.select(|m| m.name() == "c.txt").unwrap();
+    let summary = session.test_selected(&selected, RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (0, 1));
+}
