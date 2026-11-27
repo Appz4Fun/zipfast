@@ -51,6 +51,7 @@ fn setup(dir: &Path) -> OutputContext {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         },
         "input.rar".into(),
     );

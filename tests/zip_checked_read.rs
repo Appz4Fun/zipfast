@@ -109,6 +109,7 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         let error = extract::run_with_zip_policy(
             &first,
@@ -449,6 +450,7 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let result = extract::run_with_zip_policy(
                 &path,
@@ -732,6 +734,7 @@ mod direct_completion {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         }
     }
     #[test]
@@ -907,6 +910,7 @@ mod direct_aliases {
                     seven_zip_strict: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
+                    hard_link_targets: Default::default(),
                 };
                 let log_path = match alias {
                     0 => source.clone(),
@@ -1033,6 +1037,7 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         macro_rules! refuse_completion {
             ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
@@ -1178,6 +1183,7 @@ mod protected_name_completion {
                             seven_zip_strict: false,
                             unix_modes: Default::default(),
                             backslashes: Default::default(),
+                            hard_link_targets: Default::default(),
                         };
                         let output = || {
                             if extract {

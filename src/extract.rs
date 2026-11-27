@@ -229,6 +229,10 @@ pub struct Options {
     /// it (the default), or a character of the name in every format but RAR 4.x, as 7-Zip 26.06 on Unix reads it.
     /// See [`Backslashes`].
     pub backslashes: Backslashes,
+    /// Which file a hard link member is made to: the file this run extracted for its target member, wherever a rename
+    /// mode put it (the default), or the regular file found at the target's stored name, whether this run wrote it or
+    /// not, as UnRAR 7.30 and 7-Zip 26.06 `x` make it. See [`HardLinkTargets`].
+    pub hard_link_targets: HardLinkTargets,
     /// What becomes of a RAR 3.x/4.x member whose data a VM program other than the standard filters (E8, E8E9,
     /// ITANIUM, DELTA, RGB, AUDIO) filters: it fails (the default), or it is written with the block that program
     /// filters left as decoded, as 7-Zip 26.06 writes it. See [`UnsupportedFilters`].
@@ -459,19 +463,29 @@ pub enum DamagedInput {
     /// a RAR 4.x block of an unknown type whose checksum fails is passed over by its size; a header that can't be
     /// read, or a volume cut short, ends that volume without failing the run, what came before standing
     /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]). A RAR 5.0 volume without its end of
-    /// archive header is reported as ending unexpectedly, as 7-Zip 26.06 does. Encrypted headers are never salvaged:
-    /// there a checksum failure is how a wrong password shows.
+    /// archive header is reported as ending unexpectedly, as 7-Zip 26.06 does. A RAR 4.x old-style block (0x75..=0x79)
+    /// is passed over as UnRAR passes it over: an old comment (0x75) by its header alone, an old subblock (0x77) or
+    /// recovery record (0x78) with the data size it starts with, the others with their `LONG_BLOCK` data; the AV
+    /// (0x76) and sign (0x79) blocks' checksums are not checked. Encrypted headers are never salvaged: there a
+    /// checksum failure is how a wrong password shows.
     Salvage,
     /// [`Self::Salvage`], and where a header can't be read the rest of the volume is searched, in one bounded
     /// linear pass, for the next header that passes its checksum, and reading goes on from there. Neither UnRAR
     /// 7.30 nor 7-Zip 26.06 does this: it recovers the members after a damaged stretch (a hole a downloader is
     /// still to repair, garbage between blocks).
     Resync,
+    /// As 7-Zip 26.06: [`Self::Refuse`], except that a RAR 4.x old-style block (old comment 0x75, AV 0x76, old
+    /// subblock 0x77, old recovery record 0x78, sign 0x79) in clear headers is passed over by its size (its
+    /// `LONG_BLOCK` data included) without checking its checksum, as 7-Zip passes them over. So a header whose type
+    /// byte was changed into one of these is passed over, with what it covered, and nothing is reported. A sound
+    /// old-style block is passed over under [`Self::Salvage`] and [`Self::Resync`] too, as UnRAR 7.30 does, but is
+    /// refused as unsupported under [`Self::Refuse`].
+    SevenZip,
 }
 
 impl DamagedInput {
     pub(crate) fn salvages(self) -> bool {
-        !matches!(self, Self::Refuse)
+        matches!(self, Self::Salvage | Self::Resync)
     }
 }
 
@@ -678,6 +692,30 @@ impl UnixModes {
             Self::Masked { umask } => (mode | 0o700) & 0o777 & !umask,
         }
     }
+}
+
+/// Which file a hard link member is made to; see [`Options::hard_link_targets`].
+///
+/// The two differ when the target member did not land at its stored name, or was not written by this run: under a
+/// rename mode (`Overwrite::Rename`, UnRAR's `-or`, 7-Zip's `-aou`) with a file already at the target's name, under
+/// [`Overwrite::Skip`], or with the target member left out of the run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HardLinkTargets {
+    /// The file this run extracted for the target member, wherever it landed (a rename mode's new name included),
+    /// and only while it is still that file. A target this run didn't extract fails the link: a hard link never
+    /// reaches a file that was in the destination before the run.
+    #[default]
+    Extracted,
+    /// The regular file at the target member's stored name in the destination (with [`Options::flatten`], its last
+    /// component, as UnRAR `e` names it), whether this run wrote it or not: a file that was there before the run (left
+    /// by a rename mode or `Overwrite::Skip`, or a target member not taken) is linked to, as UnRAR 7.30 `x`/`e` and
+    /// 7-Zip 26.06 `x` link to it. It is reached from the destination without following any link; a symbolic link, a
+    /// folder or nothing at that name fails the link (UnRAR hard-links a symbolic link found there; zipfast never does,
+    /// so no link it makes leads out of the destination). Honoured by the whole-archive runners for RAR and tar and
+    /// by progressive sessions; [`crate::rar5::session::RarSession`] and test runs keep [`Self::Extracted`]. File
+    /// copies (RAR 5.0) are unaffected.
+    StoredName,
 }
 
 /// What a `\` in a member name is; see [`Options::backslashes`].
@@ -931,6 +969,7 @@ impl MemberRef<'_> {
 ///     seven_zip_strict: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
+///     hard_link_targets: Default::default(),
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -1065,6 +1104,27 @@ impl Options {
             meta.mode = meta.mode.map(|mode| self.unix_modes.file(mode));
         }
         meta
+    }
+
+    /// A RAR member's `meta` with the mode a run restores: under [`UnixModes::Masked`] a Unix-host member whose mode
+    /// has no file-type bits (`S_IFMT`, as a RAR 4.x attribute of `0x20` has none) is given `0o666` (a folder `0o777`)
+    /// less the umask, what file creation gives, as 7-Zip 26.06 leaves it (it sets no mode then). [`UnixModes::Stored`]
+    /// keeps the stored bits, as UnRAR 7.30 sets them.
+    pub(crate) fn rar_mode(&self, mut meta: Meta, dir: bool) -> Meta {
+        if matches!(self.unix_modes, UnixModes::Masked { .. }) && meta.mode.is_some_and(|mode| mode & 0o170000 == 0) {
+            meta.mode = Some(if dir { 0o777 } else { 0o666 });
+        }
+        meta
+    }
+
+    /// [`Self::meta`] for a RAR file member, its mode as [`Self::rar_mode`] gives it.
+    pub(crate) fn rar_meta(&self, h: &FileHeader) -> Meta {
+        self.meta(self.rar_mode(Meta::from(h), false))
+    }
+
+    /// [`Self::dir_meta`] for a RAR folder member, its mode as [`Self::rar_mode`] gives it.
+    pub(crate) fn rar_dir_meta(&self, h: &FileHeader) -> Meta {
+        self.dir_meta(self.rar_mode(Meta::from(h), true))
     }
 
     /// [`Self::meta`] for a folder.
@@ -4072,7 +4132,7 @@ impl Checks {
     /// [`Checks::from`], with the time and mode `opts` restore ([`Options::meta`]).
     fn with_options(h: &FileHeader, opts: &Options) -> Self {
         let mut checks = Checks::from(h);
-        checks.meta = opts.meta(checks.meta);
+        checks.meta = opts.meta(opts.rar_mode(checks.meta, false));
         checks
     }
 }
@@ -4714,6 +4774,7 @@ fn rar_read_at(
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4959,7 +5020,7 @@ impl Run<'_, '_, '_> {
                 crc32: h.crc32,
                 blake2sp: h.blake2sp,
                 out,
-                meta: self.opts.meta(Meta::from(h)),
+                meta: self.opts.rar_meta(h),
                 keep: self.opts.keep_broken,
             },
         };
@@ -5193,7 +5254,7 @@ impl Run<'_, '_, '_> {
                 rel,
                 place,
                 &kind,
-                self.opts.meta(Meta::from(h)).modified(),
+                self.opts.rar_meta(h).modified(),
                 &mut self.landing.extracted,
             ) {
                 if let Some(why) = link::member_failure(&e) {
@@ -5354,7 +5415,7 @@ impl Run<'_, '_, '_> {
                     self.fail_in_order(&ctx, failure, why)?;
                     return Ok(());
                 }
-                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.dir_meta(Meta::from(h))));
+                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.rar_dir_meta(h)));
             }
             return self.reports.directory(&ctx);
         }
@@ -5527,7 +5588,7 @@ impl Run<'_, '_, '_> {
         // (its decoder state is there too): it fails as 7-Zip's "Data Error", kept empty with Options::keep_broken
         if h.split_before() && h.method != 0 && self.opts.attempt_continued_members {
             if let Some(place) = place.take().filter(|_| self.opts.keep_broken && !link) {
-                let meta = self.opts.meta(Meta::from(h));
+                let meta = self.opts.rar_meta(h);
                 if let Ok(out) = create_target_detailed(place, None) {
                     let _ = out.finish_detailed(|file| keep_written(file, &meta, None));
                 }
@@ -5553,7 +5614,7 @@ impl Run<'_, '_, '_> {
         p.cipher = cipher;
         p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
-        p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.meta(Meta::from(h)));
+        p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.rar_meta(h));
         p.orphan = h.split_before() && self.opts.attempt_continued_members;
         p.place = place;
         if link && let Some(place) = p.place.take() {
@@ -6576,6 +6637,7 @@ mod tests {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
             opts.unverified_output = unverified;
@@ -6918,6 +6980,7 @@ mod read_once {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
             damaged_input: Default::default(),
         }
     }

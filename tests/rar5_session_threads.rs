@@ -102,6 +102,7 @@ fn options(dest: &Path, threads: Option<usize>, parallel_min: Option<u64>) -> Op
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

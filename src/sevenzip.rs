@@ -807,6 +807,7 @@ mod header_key_tests {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         let whole = compressions(|| {
             let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();

@@ -132,6 +132,7 @@ fn times(archive: &Path) -> Vec<(String, i64, i64)> {
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let summary = extract::run(archive, &options, |_| {}).unwrap();
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);

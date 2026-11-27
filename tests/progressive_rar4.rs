@@ -86,6 +86,7 @@ fn options(dir: &std::path::Path) -> ProgressiveOptions {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         },
         OsString::from("a.rar"),
     )

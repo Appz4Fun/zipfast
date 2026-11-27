@@ -454,6 +454,7 @@ pub(super) fn print(
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};

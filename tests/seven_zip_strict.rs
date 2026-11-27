@@ -58,6 +58,7 @@ fn options(mode: Mode, dest: &Path, strict: bool) -> Options {
         seven_zip_strict: strict,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

@@ -53,6 +53,7 @@ pub(super) fn setup(
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,

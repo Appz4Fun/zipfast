@@ -76,6 +76,7 @@ fn options(dest: &Path, mode: Mode, select: Option<MemberFilter>) -> Options {
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

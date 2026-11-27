@@ -615,6 +615,7 @@ fn r2_prefixed_zip_public_policy_context_and_selected_caps() {
             seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         for cap in [0, 24, 25] {
             let mut overrides = EncryptedReadOverrides::default();

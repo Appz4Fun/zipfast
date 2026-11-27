@@ -60,6 +60,7 @@ fn options(dest: &Path, salvage: bool, keep: bool) -> Options {
         unverified_output: Default::default(),
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
         salvage_truncated_zip: salvage,
         seven_zip_strict: false,
     }

@@ -1697,6 +1697,7 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1816,6 +1817,7 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));

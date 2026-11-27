@@ -127,6 +127,7 @@ pub(crate) fn main() -> ExitCode {
                 seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }
@@ -251,6 +252,7 @@ fn listing_options() -> Options {
         seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
