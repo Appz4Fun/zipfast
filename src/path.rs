@@ -58,19 +58,33 @@ pub(crate) fn rar4_raw_path(rel: &Path) -> Option<PathBuf> {
     if !text.chars().any(|c| ('\u{E080}'..='\u{E0FF}').contains(&c)) {
         return None;
     }
-    let mut bytes = Vec::with_capacity(text.len());
-    for c in text.chars() {
-        match u32::from(c).checked_sub(0xE000).filter(|b| (0x80..=0xFF).contains(b)) {
-            Some(byte) => bytes.push(u8::try_from(byte).ok()?),
-            None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
-        }
-    }
+    let bytes = rar4_raw_bytes(text.as_bytes().to_vec());
     if bytes.contains(&0) {
         return None;
     }
     let raw = PathBuf::from(std::ffi::OsString::from_vec(bytes));
     let normal = |path: &Path| path.components().all(|part| matches!(part, Component::Normal(_)));
     (normal(rel) && normal(&raw) && raw.components().count() == rel.components().count()).then_some(raw)
+}
+
+/// `Options::rar4_raw_names` for a RAR 4.x symbolic link's target, mapped as member names are
+/// (`crate::extract::link::rar4_target`): each U+E080..U+E0FF character back to its byte 0x80..0xFF, so the link
+/// points at the member written under its raw bytes. The bytes are never a `/`, a NUL or a `.`, so the target's
+/// components stay the ones that are checked. A target that isn't UTF-8 is returned as it is.
+pub(crate) fn rar4_raw_bytes(target: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(&target) else { return target };
+    if !text.chars().any(|c| ('\u{E080}'..='\u{E0FF}').contains(&c)) {
+        return target;
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        match u32::from(c).checked_sub(0xE000).filter(|b| (0x80..=0xFF).contains(b)).and_then(|b| u8::try_from(b).ok())
+        {
+            Some(byte) => bytes.push(byte),
+            None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    bytes
 }
 
 /// Whether a folder member's name is only `.` and separators, as in the `./` that bsdtar and Windows `tar.exe`

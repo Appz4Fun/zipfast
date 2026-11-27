@@ -3844,6 +3844,8 @@ struct LinkOut {
     /// where it goes, relative to the destination
     rel: PathBuf,
     target: Vec<u8>,
+    /// [`Options::rar4_raw_names`], taken by the destination: the target names members by their raw bytes too
+    raw_names: bool,
 }
 
 impl std::ops::Deref for Pending {
@@ -4503,11 +4505,13 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
     {
         return Err(books.terminal(&p.context, e.detailed(false)));
     }
-    if let Some(LinkOut { place, rel, target }) = p.link.take() {
+    if let Some(LinkOut { place, rel, target, raw_names }) = p.link.take() {
         // the target is the decoded data: reported with the outcome, refused or not
         p.context.link = Some(crate::rar5::Redirection::UnixSymlink(String::from_utf8_lossy(&target).into_owned()));
         // written mapped as the member names it may point at
         let target = link::rar4_target(&target).unwrap_or_default();
+        // Options::rar4_raw_names: as the members it may point at are written, under their raw bytes
+        let target = if raw_names { crate::path::rar4_raw_bytes(target) } else { target };
         let placeholder = books.landing.extracted.placeholder();
         if !placeholder && !link::contained(&rel, &target) {
             let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
@@ -5099,13 +5103,24 @@ impl Run<'_, '_, '_> {
     #[cfg(unix)]
     fn raw_path(&mut self, rel: &Path) -> Option<PathBuf> {
         let raw = crate::path::rar4_raw_path(rel)?;
-        let dest = &self.opts.dest;
-        self.raw_names.get_or_insert_with(|| takes_raw_names(dest)).then_some(raw)
+        self.takes_raw_names().then_some(raw)
     }
 
     #[cfg(not(unix))]
     fn raw_path(&mut self, _rel: &Path) -> Option<PathBuf> {
         None
+    }
+
+    /// Whether the destination takes a name that isn't UTF-8, asked once.
+    #[cfg(unix)]
+    fn takes_raw_names(&mut self) -> bool {
+        let dest = &self.opts.dest;
+        *self.raw_names.get_or_insert_with(|| takes_raw_names(dest))
+    }
+
+    #[cfg(not(unix))]
+    fn takes_raw_names(&mut self) -> bool {
+        false
     }
 
     fn drain(&mut self) -> RunResult<()> {
@@ -5890,7 +5905,8 @@ impl Run<'_, '_, '_> {
         p.place = place;
         if link && let Some(place) = p.place.take() {
             self.dirs.forget();
-            p.link = Some(LinkOut { place, rel, target: Vec::new() });
+            let raw_names = self.opts.rar4_raw_names && h.format == RarFormat::Rar4 && self.takes_raw_names();
+            p.link = Some(LinkOut { place, rel, target: Vec::new(), raw_names });
         }
         self.begin_decoding(vol, h, p)
     }
